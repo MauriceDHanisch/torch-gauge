@@ -1,25 +1,19 @@
 from dataclasses import dataclass
 from typing import Sequence
-
 import torch
-
 import torch_gauge.o3
 from torch_gauge.o3.spherical import SphericalTensor
-
 
 @dataclass
 class VerletList:
     """
     The padded Verlet-List class for tracking and manipulating relational data.
-
     Assuming in-edges and out-edges are identical (undirected graph).
-
     Warning:
         Due to the padding, the current VerletList scheme will break vanilla Batch Normalization
         operation on edges. MaskedBatchNorm2d will be implemented in the future for edge feature
         normalization.
     """
-
     def __init__(self):
         self.neighbor_idx = None
         self.ndata = {}
@@ -29,7 +23,6 @@ class VerletList:
         self.PADSIZE = None
         self.batch_num_nodes = None
         self._dst_edim_locators = None
-
     def from_mask(
         self,
         verlet_mask: torch.BoolTensor,
@@ -37,38 +30,42 @@ class VerletList:
         num_nodes,
         one_body_data,
         two_body_data,
+        device='cuda:0'
     ):
         self.PADSIZE = padding_size
         self.n_nodes = num_nodes
-        self.batch_num_nodes = torch.LongTensor([self.n_nodes])
-
+        self.batch_num_nodes = torch.tensor([self.n_nodes], dtype=torch.long, device=device)
+        # Ensure verlet_mask is on the correct device
+        verlet_mask = verlet_mask.to(device)
         in_degrees = verlet_mask.long().sum(1)
         src_raw = (
-            torch.arange(num_nodes, dtype=torch.long)
+            torch.arange(num_nodes, dtype=torch.long, device=device)
             .unsqueeze(0)
             .expand(num_nodes, num_nodes)[verlet_mask]
         )
-
         # Scatter the src node-ids to the (N*PADDING_SIZE) padded table
-        src_locators_1d = torch.LongTensor(
+        src_locators_1d = torch.tensor(
             [
                 dstid * self.PADSIZE + src_location
                 for dstid in range(self.n_nodes)
-                for src_location in range(in_degrees[dstid])
-            ]
+                for src_location in range(in_degrees[dstid].item())
+            ],
+            dtype=torch.long,
+            device=device,
         )
-        src_edim_locators_flattened = torch.LongTensor(
+        src_edim_locators_flattened = torch.tensor(
             [
                 src_location
                 for dstid in range(self.n_nodes)
-                for src_location in range(in_degrees[dstid])
-            ]
+                for src_location in range(in_degrees[dstid].item())
+            ],
+            dtype=torch.long,
+            device=device,
         )
-        src_edim_locators = torch.zeros(num_nodes, num_nodes, dtype=torch.long)
+        src_edim_locators = torch.zeros(num_nodes, num_nodes, dtype=torch.long, device=device)
         src_edim_locators[verlet_mask] = src_edim_locators_flattened
-
         self.neighbor_idx = (
-            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.long)
+            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.long, device=device)
             .scatter_(
                 dim=0,
                 index=src_locators_1d,
@@ -76,69 +73,71 @@ class VerletList:
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
         self.edge_mask = (
-            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.bool)
+            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.bool, device=device)
             .scatter_(
                 dim=0,
                 index=src_locators_1d,
-                src=torch.ones(src_raw.size(0), dtype=torch.bool),
+                src=torch.ones(src_raw.size(0), dtype=torch.bool, device=device),
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
         self._dst_edim_locators = (
-            torch.zeros(self.n_nodes, self.PADSIZE, dtype=torch.long)
+            torch.zeros(self.n_nodes, self.PADSIZE, dtype=torch.long, device=device)
             .masked_scatter_(
                 mask=self.edge_mask,
                 source=src_edim_locators.t()[verlet_mask],
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
-        self.ndata = one_body_data
+        # Move one_body_data to device if necessary
+        self.ndata = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in one_body_data.items()}
         # edata can be understood as node data with additional "neighborhood" dimensions
         # To make padding easier, always unsqueeze at least one trailing dimension
         self.edata = {
-            k: self._scatter_efeat(edata, verlet_mask, src_raw)
+            k: self._scatter_efeat(edata, verlet_mask, src_raw, device=device)
             for k, edata in two_body_data.items()
         }
-
         return self
-
-    def from_dgl(self, g: "dgl.DGLGraph", padding_size, nkeys, ekeys):
+    def from_dgl(self, g: "dgl.DGLGraph", padding_size, nkeys, ekeys, device='cuda:0'):
         """
         The interface for generating Verlet-list from the ``dgl.DGLGraph`` class
         in the DGL library https://docs.dgl.ai/api/python/dgl.DGLGraph.html.
-
         Only scalar type tensors are supported.
         """
         self.PADSIZE = padding_size
         self.n_nodes = g.num_nodes()
-        self.batch_num_nodes = torch.LongTensor([self.n_nodes])
-
-        src_raw, dst_raw, eid_raw = g.in_edges(torch.arange(self.n_nodes), form="all")
-        in_degrees = g.in_degrees(torch.arange(self.n_nodes))
-
+        self.batch_num_nodes = torch.tensor([self.n_nodes], dtype=torch.long, device=device)
+        src_raw, dst_raw, eid_raw = g.in_edges(torch.arange(self.n_nodes, device=device), form="all")
+        in_degrees = g.in_degrees(torch.arange(self.n_nodes, device=device))
+        # Ensure that tensors are on the correct device
+        src_raw = src_raw.to(device)
+        dst_raw = dst_raw.to(device)
+        eid_raw = eid_raw.to(device)
+        in_degrees = in_degrees.to(device)
         # Scatter the src node-ids to the (N*PADDING_SIZE) padded table
-        src_locators_1d = torch.LongTensor(
+        src_locators_1d = torch.tensor(
             [
-                dstid * self.PADSIZE + src_location
-                for dstid in range(self.n_nodes)
-                for src_location in range(in_degrees[dstid])
-            ]
+                dstid.item() * self.PADSIZE + src_location
+                for dstid in dst_raw
+                for src_location in range(in_degrees[dstid].item())
+            ],
+            dtype=torch.long,
+            device=device,
         )
-        src_edim_locators = torch.LongTensor(
+        src_edim_locators = torch.tensor(
             [
                 src_location
-                for dstid in range(self.n_nodes)
-                for src_location in range(in_degrees[dstid])
-            ]
+                for dstid in dst_raw
+                for src_location in range(in_degrees[dstid].item())
+            ],
+            dtype=torch.long,
+            device=device,
         )
         g.edata["dst_edim_locators"] = torch.zeros_like(src_edim_locators)
         g.edata["dst_edim_locators"][g.edge_ids(src_raw, dst_raw)] = src_edim_locators
         self._dst_edim_locators = (
-            torch.zeros(self.n_nodes * self.PADSIZE, dtype=src_raw.dtype)
+            torch.zeros(self.n_nodes * self.PADSIZE, dtype=src_raw.dtype, device=device)
             .scatter_(
                 dim=0,
                 index=src_locators_1d,
@@ -146,9 +145,8 @@ class VerletList:
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
         self.neighbor_idx = (
-            torch.zeros(self.n_nodes * self.PADSIZE, dtype=src_raw.dtype)
+            torch.zeros(self.n_nodes * self.PADSIZE, dtype=src_raw.dtype, device=device)
             .scatter_(
                 dim=0,
                 index=src_locators_1d,
@@ -156,23 +154,22 @@ class VerletList:
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
         self.edge_mask = (
-            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.bool)
+            torch.zeros(self.n_nodes * self.PADSIZE, dtype=torch.bool, device=device)
             .scatter_(
                 dim=0,
                 index=src_locators_1d,
-                src=torch.ones(eid_raw.size(0), dtype=torch.bool),
+                src=torch.ones(eid_raw.size(0), dtype=torch.bool, device=device),
             )
             .view(self.n_nodes, self.PADSIZE)
         )
-
-        self.ndata = {k: g.ndata[k] for k in nkeys}
+        self.ndata = {k: g.ndata[k].to(device) for k in nkeys}
         self.edata = {
             k: torch.zeros(
                 self.n_nodes * self.PADSIZE,
                 g.edata[k][0, ...].numel(),
                 dtype=g.edata[k].dtype,
+                device=device,
             )
             .scatter_(
                 dim=0,
@@ -185,12 +182,12 @@ class VerletList:
             for k in ekeys
         }
         return self
-
-    def _scatter_efeat(self, edata, verlet_mask, src_raw):
+    def _scatter_efeat(self, edata, verlet_mask, src_raw, device='cuda:0'):
         if isinstance(edata, torch.Tensor):
+            edata = edata.to(device)
             if not verlet_mask.any():
                 return torch.zeros(
-                    self.n_nodes, self.PADSIZE, *edata.shape[2:], dtype=edata.dtype
+                    self.n_nodes, self.PADSIZE, *edata.shape[2:], dtype=edata.dtype, device=device
                 )
             return (
                 torch.zeros(
@@ -198,6 +195,7 @@ class VerletList:
                     self.PADSIZE,
                     *edata.shape[2:],
                     dtype=edata.dtype,
+                    device=device,
                 )
                 .view(self.n_nodes, self.PADSIZE, -1)
                 .masked_scatter_(
@@ -207,6 +205,7 @@ class VerletList:
                 .view(self.n_nodes, self.PADSIZE, *edata.shape[2:])
             )
         elif isinstance(edata, SphericalTensor):
+            edata = edata.to(device)
             if not verlet_mask.any():
                 return edata.self_like(
                     torch.zeros(
@@ -214,6 +213,7 @@ class VerletList:
                         self.PADSIZE,
                         *edata.shape[2:],
                         dtype=edata.ten.dtype,
+                        device=device,
                     )
                 )
             out_ten = (
@@ -222,6 +222,7 @@ class VerletList:
                     self.PADSIZE,
                     *edata.shape[2:],
                     dtype=edata.ten.dtype,
+                    device=device,
                 )
                 .view(self.n_nodes, self.PADSIZE, -1)
                 .masked_scatter_(
@@ -231,14 +232,13 @@ class VerletList:
                 .view(self.n_nodes, self.PADSIZE, *edata.shape[2:])
             )
             return edata.self_like(out_ten)
-
+        else:
+            raise NotImplementedError
     def query_src(self, src_feat):
         """
         Returns the src-node data scattered into the neighbor-list frame.
-
         When applied to an edge-data tensor, this function generates a higher-order
         view (k+1 hop) of the underlying k-hop graph structure.
-
         Args:
             src_feat (torch.Tensor or SphericalTensor):
                 The data to be queried, must be contiguous.
@@ -266,15 +266,12 @@ class VerletList:
                 rep_layout=src_feat.rep_layout,
                 num_channels=src_feat.num_channels,
             )
-
     def to_src_first_view(self, data):
         """
         Flipping src / dst node indexing order without inverting the data.
-
         Note:
             When the underlying data is a dense matrix, this operation reduces to
             a matrix transpose operation.
-
         Args:
             data (torch.Tensor or SphericalTensor):
                 The data to be transposed, must be contiguous.
@@ -296,7 +293,6 @@ class VerletList:
             return data.self_like(out_ten.view_as(data.ten))
         else:
             raise NotImplementedError
-
     def to(self, device):
         """
         Args:
@@ -313,84 +309,78 @@ class VerletList:
         self._dst_edim_locators = self._dst_edim_locators.to(device)
         self.batch_num_nodes = self.batch_num_nodes.to(device)
         return self
-
     def to_numpy_dict(self):
         return {
             "PADSIZE": self.PADSIZE,
             "n_nodes": self.n_nodes,
-            "neighbor_idx": self.neighbor_idx.numpy(),
-            "edge_mask": self.edge_mask.numpy(),
-            "_dst_edim_locators": self._dst_edim_locators.numpy(),
-            "batch_num_nodes": self.batch_num_nodes.numpy(),
+            "neighbor_idx": self.neighbor_idx.cpu().numpy(),
+            "edge_mask": self.edge_mask.cpu().numpy(),
+            "_dst_edim_locators": self._dst_edim_locators.cpu().numpy(),
+            "batch_num_nodes": self.batch_num_nodes.cpu().numpy(),
             "ndata": {nk: torch_gauge.o3.to_numpy(nv) for nk, nv in self.ndata.items()},
             "edata": {ek: torch_gauge.o3.to_numpy(ev) for ek, ev in self.edata.items()},
         }
-
-    def from_numpy_dict(self, src_dict):
+    def from_numpy_dict(self, src_dict, device='cuda:0'):
         self.PADSIZE = src_dict["PADSIZE"]
         self.n_nodes = src_dict["n_nodes"]
-        self.neighbor_idx = torch.from_numpy(src_dict["neighbor_idx"])
-        self.edge_mask = torch.from_numpy(src_dict["edge_mask"])
-        self._dst_edim_locators = torch.from_numpy(src_dict["_dst_edim_locators"])
-        self.batch_num_nodes = torch.from_numpy(src_dict["batch_num_nodes"])
+        self.neighbor_idx = torch.from_numpy(src_dict["neighbor_idx"]).to(device)
+        self.edge_mask = torch.from_numpy(src_dict["edge_mask"]).to(device)
+        self._dst_edim_locators = torch.from_numpy(src_dict["_dst_edim_locators"]).to(device)
+        self.batch_num_nodes = torch.from_numpy(src_dict["batch_num_nodes"]).to(device)
         self.ndata = {
-            nk: torch_gauge.o3.from_numpy(nv) for nk, nv in src_dict["ndata"].items()
+            nk: torch_gauge.o3.from_numpy(nv).to(device) for nk, nv in src_dict["ndata"].items()
         }
         self.edata = {
-            ek: torch_gauge.o3.from_numpy(ev) for ek, ev in src_dict["edata"].items()
+            ek: torch_gauge.o3.from_numpy(ev).to(device) for ek, ev in src_dict["edata"].items()
         }
         return self
-
     @staticmethod
-    def batch(vls: Sequence["VerletList"]):
+    def batch(vls: Sequence["VerletList"], device='cuda:0'):
         """
         Batching a list of VerletLists.
-
         Returns:
             A VerletList instance containing batched data and indices.
-
         Warning:
             In the current version, taking batch of batched VerletLists is not supported.
         """
         batched_vl = VerletList()
         batched_vl.PADSIZE = vls[0].PADSIZE
-        batched_vl.batch_num_nodes = torch.cat([vl.batch_num_nodes for vl in vls])
+        batched_vl.batch_num_nodes = torch.cat([vl.batch_num_nodes for vl in vls]).to(device)
         batched_vl.n_nodes = torch.sum(batched_vl.batch_num_nodes)
         bnn_offsets = torch.repeat_interleave(
             torch.cat(
-                [torch.LongTensor([0]), torch.cumsum(batched_vl.batch_num_nodes, dim=0)]
+                [torch.tensor([0], device=device), torch.cumsum(batched_vl.batch_num_nodes, dim=0)]
             )[:-1],
             batched_vl.batch_num_nodes,
         )
         batched_vl.neighbor_idx = torch.cat(
             [vl.neighbor_idx for vl in vls], dim=0
-        ) + bnn_offsets.unsqueeze(1)
-        batched_vl.edge_mask = torch.cat([vl.edge_mask for vl in vls], dim=0)
+        ).to(device) + bnn_offsets.unsqueeze(1)
+        batched_vl.edge_mask = torch.cat([vl.edge_mask for vl in vls], dim=0).to(device)
         batched_vl.ndata = {}
         for nk, nfeat in vls[0].ndata.items():
             if isinstance(nfeat, SphericalTensor):
                 batched_vl.ndata[nk] = nfeat.self_like(
-                    torch.cat([vl.ndata[nk].ten for vl in vls], dim=0)
+                    torch.cat([vl.ndata[nk].ten for vl in vls], dim=0).to(device)
                 )
             elif isinstance(nfeat, torch.Tensor):
-                batched_vl.ndata[nk] = torch.cat([vl.ndata[nk] for vl in vls], dim=0)
+                batched_vl.ndata[nk] = torch.cat([vl.ndata[nk] for vl in vls], dim=0).to(device)
             else:
                 raise NotImplementedError
         batched_vl.edata = {}
         for ek, efeat in vls[0].edata.items():
             if isinstance(efeat, SphericalTensor):
                 batched_vl.edata[ek] = efeat.self_like(
-                    torch.cat([vl.edata[ek].ten for vl in vls], dim=0)
+                    torch.cat([vl.edata[ek].ten for vl in vls], dim=0).to(device)
                 )
             elif isinstance(efeat, torch.Tensor):
-                batched_vl.edata[ek] = torch.cat([vl.edata[ek] for vl in vls], dim=0)
+                batched_vl.edata[ek] = torch.cat([vl.edata[ek] for vl in vls], dim=0).to(device)
             elif efeat is None:
                 batched_vl.edata[ek] = None
             else:
                 raise NotImplementedError
-
         batched_vl._dst_edim_locators = torch.cat(
             [vl._dst_edim_locators for vl in vls], dim=0
-        )
-
+        ).to(device)
         return batched_vl
+
